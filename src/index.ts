@@ -15,17 +15,27 @@ connectDB();
 
 const app = express();
 const server = http.createServer(app);
+
+const allowedOrigin = process.env.NODE_ENV === 'production' 
+  ? "https://draw-charades-app.vercel.app" 
+  : "http://localhost:3000";
+
 const io = new Server(server, {
   cors: {
-    origin: "*", 
+    origin: allowedOrigin,
     methods: ["GET", "POST"],
+    credentials: true
   },
+  transports: ['websocket', 'polling']
 });
 
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: allowedOrigin,
+  credentials: true
+}));
 app.use(helmet());
 app.use(morgan("dev"));
 app.use(express.json());
