@@ -9,6 +9,7 @@ interface GameState {
   timer: number;
   votes: Record<string, string[]>; // movie -> [playerIds]
   options: string[];
+  drawerIndex: Record<"A" | "B", number>; // Keep track of whose turn it is in each team
 }
 
 const gameStates: Record<string, GameState> = {};
@@ -30,40 +31,40 @@ export const handleGameEvents = (io: Server, socket: Socket, rooms: any) => {
     }, 1000);
   };
 
-  // Start Game
-  socket.on("start_game", (roomCode: string) => {
+  const startSelectingPhase = (roomCode: string) => {
     const room = rooms[roomCode];
-    if (!room) return;
+    const state = gameStates[roomCode];
+    if (!room || !state) return;
 
-    // Pick Team A to draw first
-    const guessingTeam = "A";
-    const drawer = room.players.find((p: any) => p.team === guessingTeam);
+    // Switch guessing team
+    state.guessingTeam = state.guessingTeam === "A" ? "B" : "A";
     
+    // Pick next drawer from the guessing team
+    const teamPlayers = room.players.filter((p: any) => p.team === state.guessingTeam);
+    if (teamPlayers.length > 0) {
+      state.drawerIndex[state.guessingTeam] = (state.drawerIndex[state.guessingTeam] + 1) % teamPlayers.length;
+      state.currentDrawerId = teamPlayers[state.drawerIndex[state.guessingTeam]].id;
+    }
+
     const options = getRandomMovies(4);
-    gameStates[roomCode] = {
-      currentDrawerId: drawer?.id || null,
-      guessingTeam,
-      currentMovie: null,
-      gamePhase: "SELECTING",
-      timer: 10,
-      votes: {},
-      options
-    };
+    state.options = options;
+    state.votes = {};
+    state.gamePhase = "SELECTING";
+    state.timer = 10;
+    state.currentMovie = null;
 
     io.to(roomCode).emit("game_started", {
       phase: "SELECTING",
       options,
-      drawerId: drawer?.id,
-      guessingTeam,
+      drawerId: state.currentDrawerId,
+      guessingTeam: state.guessingTeam,
       timer: 10
     });
 
-    // Start 10s voting timer
     startTimer(roomCode, 10, 
       (t) => io.to(roomCode).emit("timer_update", t),
       () => {
         // Voting ended - pick winner
-        const state = gameStates[roomCode];
         if (state.gamePhase !== "SELECTING") return;
 
         let winner = state.options[0];
@@ -76,26 +77,77 @@ export const handleGameEvents = (io: Server, socket: Socket, rooms: any) => {
           }
         });
 
-        // Start Drawing Phase
-        state.currentMovie = winner;
-        state.gamePhase = "DRAWING";
-        const drawDuration = room.settings?.timerDuration || 60;
-        state.timer = drawDuration;
-
-        io.to(roomCode).emit("round_started", {
-          movie: winner,
-          timer: drawDuration
-        });
-
-        startTimer(roomCode, drawDuration,
-          (t) => io.to(roomCode).emit("timer_update", t),
-          () => {
-             io.to(roomCode).emit("timer_end");
-             state.gamePhase = "ROUND_END";
-          }
-        );
+        startDrawingPhase(roomCode, winner);
       }
     );
+  };
+
+  const startDrawingPhase = (roomCode: string, movie: string) => {
+    const state = gameStates[roomCode];
+    const room = rooms[roomCode];
+    if (!state || !room) return;
+
+    state.currentMovie = movie;
+    state.gamePhase = "DRAWING";
+    const drawDuration = room.settings?.timerDuration || 60;
+    state.timer = drawDuration;
+
+    io.to(roomCode).emit("round_started", {
+      movie,
+      timer: drawDuration
+    });
+
+    startTimer(roomCode, drawDuration,
+      (t) => io.to(roomCode).emit("timer_update", t),
+      () => {
+        endRound(roomCode, null); // Time up
+      }
+    );
+  };
+
+  const endRound = (roomCode: string, winnerName: string | null) => {
+    const state = gameStates[roomCode];
+    const room = rooms[roomCode];
+    if (!state || !room) return;
+
+    clearInterval(timers[roomCode]);
+    state.gamePhase = "ROUND_END";
+
+    if (winnerName) {
+      // Award points
+      room.scores[state.guessingTeam!] += 10;
+      io.to(roomCode).emit("correct_guess", { playerName: winnerName, movie: state.currentMovie });
+    } else {
+      io.to(roomCode).emit("round_time_up", { movie: state.currentMovie });
+    }
+
+    io.to(roomCode).emit("scores_updated", room.scores);
+
+    // Wait 5 seconds then start next round
+    setTimeout(() => {
+      startSelectingPhase(roomCode);
+    }, 5000);
+  };
+
+  // Start Game (Initial)
+  socket.on("start_game", (roomCode: string) => {
+    const room = rooms[roomCode];
+    if (!room) return;
+
+    room.scores = { A: 0, B: 0 };
+    
+    gameStates[roomCode] = {
+      currentDrawerId: null,
+      guessingTeam: "B", // Will switch to A in startSelectingPhase
+      currentMovie: null,
+      gamePhase: "LOBBY",
+      timer: 0,
+      votes: {},
+      options: [],
+      drawerIndex: { A: -1, B: -1 }
+    };
+
+    startSelectingPhase(roomCode);
   });
 
   // Vote for Movie
@@ -122,18 +174,19 @@ export const handleGameEvents = (io: Server, socket: Socket, rooms: any) => {
     if (!state || state.gamePhase !== "DRAWING") return;
 
     const player = room.players.find((p: any) => p.id === socket.id);
+    if (!player) return;
     
-    // Only guessing team can chat
+    // Only guessing team can chat (and not the drawer)
     if (player.team !== state.guessingTeam || player.id === state.currentDrawerId) {
-       return; // Block chat
+       // Optional: allow team chat that isn't guesses? 
+       // For now, let's just allow drawer to see but not chat.
+       return; 
     }
 
     const isCorrect = state.currentMovie?.toLowerCase() === message.trim().toLowerCase();
 
     if (isCorrect) {
-      clearInterval(timers[roomCode]);
-      io.to(roomCode).emit("correct_guess", { playerName, movie: state.currentMovie });
-      state.gamePhase = "ROUND_END";
+      endRound(roomCode, playerName);
     } else {
       io.to(roomCode).emit("new_message", { playerName, message, isSystem: false });
     }
